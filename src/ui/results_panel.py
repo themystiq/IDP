@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from src.exceptions import ExtractionError, ExtractionTimeoutError
-from src.extraction import extract_and_classify
+from src.extraction import INFORMATIONAL_DOC_TYPES, extract_and_classify
 from src.ledger_data import (
     get_sample_1099_misc_ledger,
     get_sample_general_ledger,
@@ -27,6 +27,59 @@ from src.reconciliation import (
     reconcile_k1,
     reconcile_w2,
 )
+
+# Display metadata for the four *informational* doc types (see extraction.py's
+# INFORMATIONAL_DOC_TYPES / schemas.py's BankStatement docstring) — no "reconcile"/"ledger"
+# keys like RECONCILERS below, since these are never run through reconciliation at all.
+INFO_FIELDS = {
+    "Bank Statement": {
+        "subject": lambda e: e.bank_statement_holder_name or e.bank_name or "Unknown",
+        "fields": [
+            ("Account Holder", "bank_statement_holder_name"),
+            ("Bank", "bank_name"),
+            ("Account (last 4)", "bank_account_last4"),
+            ("Statement Period", "bank_statement_period"),
+            ("Ending Balance", "bank_statement_ending_balance"),
+        ],
+    },
+    "Payroll Summary": {
+        "subject": lambda e: e.payroll_company_name or "Unknown",
+        "fields": [
+            ("Company", "payroll_company_name"),
+            ("Pay Period", "payroll_period"),
+            ("Total Gross Pay", "payroll_total_gross_pay"),
+            ("Employee Count", "payroll_employee_count"),
+        ],
+    },
+    "EIN Letter": {
+        "subject": lambda e: e.ein_letter_entity_name or "Unknown",
+        "fields": [
+            ("Entity Name", "ein_letter_entity_name"),
+            ("EIN", "ein_letter_ein"),
+            ("Date Issued", "ein_letter_date_issued"),
+        ],
+    },
+    "Balance Sheet": {
+        "subject": lambda e: e.balance_sheet_company_name or "Unknown",
+        "fields": [
+            ("Company", "balance_sheet_company_name"),
+            ("As Of Date", "balance_sheet_as_of_date"),
+            ("Total Assets", "balance_sheet_total_assets"),
+            ("Total Liabilities", "balance_sheet_total_liabilities"),
+            ("Total Equity", "balance_sheet_total_equity"),
+        ],
+    },
+    "Credit Card Statement": {
+        "subject": lambda e: e.credit_card_holder_name or e.credit_card_issuer or "Unknown",
+        "fields": [
+            ("Cardholder", "credit_card_holder_name"),
+            ("Issuer", "credit_card_issuer"),
+            ("Card (last 4)", "credit_card_last4"),
+            ("Statement Period", "credit_card_statement_period"),
+            ("Statement Balance", "credit_card_statement_balance"),
+        ],
+    },
+}
 
 RECONCILERS = {
     "1099-NEC": {
@@ -66,7 +119,12 @@ RECONCILERS = {
 
 def _process_document(doc: dict) -> dict:
     """Run extraction + reconciliation for one uploaded document. Never raises —
-    a failure is captured in the returned dict's "error" key instead."""
+    a failure is captured in the returned dict's "error" key instead.
+
+    doc_type outside RECONCILERS (i.e. one of extraction.INFORMATIONAL_DOC_TYPES) leaves
+    "reconciliation" as None by design, not as a failure — there's no ledger to check it
+    against. Every downstream reader that branches on `r["reconciliation"]` treats None as
+    "informational, not audited" rather than "errored" (errors have their own "error" key)."""
     outcome = {
         "doc_name": doc["name"],
         "doc_type": None,
@@ -76,11 +134,11 @@ def _process_document(doc: dict) -> dict:
     }
     try:
         extracted, doc_type = extract_and_classify(doc["base64_images"][0])
-        reconciler = RECONCILERS[doc_type]
-        reconciliation = reconciler["reconcile"](extracted, reconciler["ledger"]())
         outcome["doc_type"] = doc_type
         outcome["extracted"] = extracted
-        outcome["reconciliation"] = reconciliation
+        if doc_type in RECONCILERS:
+            reconciler = RECONCILERS[doc_type]
+            outcome["reconciliation"] = reconciler["reconcile"](extracted, reconciler["ledger"]())
     except ExtractionTimeoutError as e:
         outcome["error"] = str(e)
     except ExtractionError as e:
@@ -137,6 +195,13 @@ def _render_workflow_indicator(documents: list, batch_results) -> None:
     succeeded but validation failed" — both raise the same ExtractionError. Rather than
     fabricate a distinction the app's data doesn't actually have, both stages share the same
     real signal: whether at least one document has a non-None `extracted` value.
+
+    An informational doc type (bank statement, payroll summary, etc. — see
+    extraction.INFORMATIONAL_DOC_TYPES) extracts successfully but is never reconciled by
+    design (`reconciliation` stays None, not because anything failed). So "Reconciled" only
+    reads as failed when *nothing* in the batch reached either reconciliation or a
+    successful informational extraction — not merely because some/all documents were
+    informational.
     """
     ingested_done = bool(documents) or bool(batch_results)
 
@@ -147,6 +212,9 @@ def _render_workflow_indicator(documents: list, batch_results) -> None:
     else:
         validated_count = sum(1 for r in batch_results if r["extracted"] is not None)
         reconciled_count = sum(1 for r in batch_results if r["reconciliation"] is not None)
+        informational_count = sum(
+            1 for r in batch_results if r["extracted"] is not None and r["reconciliation"] is None
+        )
         reconciled_needs_review = sum(
             1
             for r in batch_results
@@ -155,7 +223,7 @@ def _render_workflow_indicator(documents: list, batch_results) -> None:
 
         extracted_status = "done" if validated_count > 0 else "failed"
         validated_status = extracted_status
-        if reconciled_count == 0:
+        if reconciled_count == 0 and informational_count == 0:
             reconciled_status = "failed"
         elif reconciled_needs_review > 0:
             reconciled_status = "amber"
@@ -253,10 +321,15 @@ def _status_cell(recon: dict) -> str:
 
 def _group_by_taxpayer(batch_results: list) -> dict:
     """Group successfully-processed documents by normalized taxpayer ID. Documents with no
-    extractable TIN each get their own unmerged group (never silently combined)."""
+    extractable TIN each get their own unmerged group (never silently combined).
+
+    Informational doc types (see extraction.INFORMATIONAL_DOC_TYPES) have no RECONCILERS
+    entry — no "tin"/"subject" accessor to call — and no reconciliation status to badge, so
+    they're excluded here and rendered in their own section instead (see
+    render_results_panel's "Other Identified Documents")."""
     groups = {}
     for r in batch_results:
-        if r["error"]:
+        if r["error"] or r["doc_type"] in INFORMATIONAL_DOC_TYPES:
             continue
         reconciler = RECONCILERS[r["doc_type"]]
         raw_tin = reconciler["tin"](r["extracted"]) or ""
@@ -291,15 +364,19 @@ def render_results_panel(extract_clicked: bool, documents: list) -> None:
         return
 
     # --- Summary metrics -----------------------------------------------------------------
+    # Informational doc types (bank statement, payroll summary, etc.) have reconciliation ==
+    # None by design, not an error — guard every status check here so they're simply excluded
+    # from green/amber/red (they get their own "Other Identified Documents" section below)
+    # rather than crashing on `None["status"]`.
     total_count = len(batch_results)
     green_count = sum(
-        1 for r in batch_results if not r["error"] and r["reconciliation"]["status"] == "GREEN"
+        1 for r in batch_results if r["reconciliation"] and r["reconciliation"]["status"] == "GREEN"
     )
     amber_count = sum(
-        1 for r in batch_results if not r["error"] and r["reconciliation"]["status"] == "AMBER"
+        1 for r in batch_results if r["reconciliation"] and r["reconciliation"]["status"] == "AMBER"
     )
     red_count = sum(
-        1 for r in batch_results if not r["error"] and r["reconciliation"]["status"] == "RED"
+        1 for r in batch_results if r["reconciliation"] and r["reconciliation"]["status"] == "RED"
     )
     error_count = sum(1 for r in batch_results if r["error"])
 
@@ -339,6 +416,27 @@ def render_results_panel(extract_clicked: bool, documents: list) -> None:
         st.markdown("**⚠️ Failed to Process:**")
         for r in error_rows:
             st.error(f"{r['doc_name']}: {r['error']}")
+
+    # --- Informational documents (bank statement, payroll summary, EIN letter, balance
+    # sheet) ----------------------------------------------------------------------------
+    # These doc types have no ledger to audit against, so they're classified and displayed
+    # here instead of in the taxpayer-grouped Customer Reconciliation cards below (which
+    # _group_by_taxpayer excludes them from).
+    info_rows = [r for r in batch_results if not r["error"] and r["doc_type"] in INFORMATIONAL_DOC_TYPES]
+    if info_rows:
+        st.markdown("**📋 Other Identified Documents (not reconciled):**")
+        for r in info_rows:
+            info_meta = INFO_FIELDS[r["doc_type"]]
+            subject = info_meta["subject"](r["extracted"])
+            with st.expander(f"ℹ️ [{r['doc_type']}] {subject}"):
+                field_rows = []
+                for label, attr in info_meta["fields"]:
+                    value = getattr(r["extracted"], attr, None)
+                    if isinstance(value, float):
+                        value = _currency(value)
+                    field_rows.append({"Field": label, "Value": value if value is not None else "N/A"})
+                st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+                st.caption("No reconciliation ledger exists for this document type — informational only.")
 
     # --- Customer-grouped detail ---------------------------------------------------------
     st.divider()
@@ -438,7 +536,9 @@ def render_results_panel(extract_clicked: bool, documents: list) -> None:
             {
                 "document_name": r["doc_name"],
                 **data_dict,
-                **{f"reconciliation_{k}": v for k, v in r["reconciliation"].items()},
+                # Informational doc types have reconciliation == None by design (see
+                # _process_document) — nothing to flatten in that case, not a bug.
+                **{f"reconciliation_{k}": v for k, v in (r["reconciliation"] or {}).items()},
             }
         )
 

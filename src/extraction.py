@@ -1,6 +1,9 @@
-"""LiteLLM + Claude vision extraction: a single call classifies the document as
-1099-NEC / 1099-MISC / W-2 / Schedule K-1 and extracts its fields in one shot, then the
-result is validated against whichever Pydantic schema matches the detected type."""
+"""LiteLLM + Claude vision extraction: a single call classifies the document as one of nine
+types — 1099-NEC / 1099-MISC / W-2 / Schedule K-1 (audited against a ledger) or Bank
+Statement / Payroll Summary / EIN Letter / Balance Sheet / Credit Card Statement (identified
+and displayed, but not reconciled — see INFORMATIONAL_DOC_TYPES below) — and extracts its
+fields in one shot, then the result is validated against whichever Pydantic schema matches
+the detected type."""
 import concurrent.futures
 import json
 import re
@@ -9,17 +12,35 @@ import litellm
 
 from src import config
 from src.exceptions import ExtractionError, ExtractionTimeoutError
-from src.schemas import Form1099Misc, Form1099NEC, FormK1, FormW2
+from src.schemas import (
+    BalanceSheet,
+    BankStatement,
+    CreditCardStatement,
+    EINLetter,
+    Form1099Misc,
+    Form1099NEC,
+    FormK1,
+    FormW2,
+    PayrollSummary,
+)
 
 UNIFIED_EXTRACTION_PROMPT = """You are an expert CPA document-extraction system.
 
-First, determine which of these four IRS form types this image is:
+First, determine which of these document types this image is. The first four are IRS forms
+this tool actively audits; the rest are recognized for identification/reference only —
+extract their headline fields but don't worry about completeness:
 - "1099-NEC" (Nonemployee Compensation)
 - "1099-MISC" (Miscellaneous Information)
 - "W2" (Wage and Tax Statement)
 - "K-1" (Schedule K-1, partner's/shareholder's share of income from a partnership)
+- "Bank Statement" (a bank account statement)
+- "Payroll Summary" (an internal payroll report covering multiple employees/a pay period,
+  not one employee's W-2)
+- "EIN Letter" (an IRS EIN confirmation notice, e.g. CP 575)
+- "Balance Sheet" (a company balance sheet / statement of financial position)
+- "Credit Card Statement" (a credit card account statement)
 
-Then extract only the fields that apply to that specific form type. Return ONLY a raw JSON
+Then extract only the fields that apply to that specific type. Return ONLY a raw JSON
 object (no markdown fences, no commentary) with exactly these keys:
 
 - document_type (string: one of "1099-NEC", "1099-MISC", "W2", "K-1")
@@ -45,6 +66,31 @@ object (no markdown fences, no commentary) with exactly these keys:
   commas; this may be negative if the K-1 reports a loss)
 - net_rental_real_estate_income (number or null, K-1 Box 2, no $ or commas; may be negative)
 - tax_year (string or null, 4-digit year)
+- bank_statement_holder_name (string or null — Bank Statement only)
+- bank_name (string or null — Bank Statement only)
+- bank_account_last4 (string or null, last 4 digits only — never the full account number —
+  Bank Statement only)
+- bank_statement_period (string or null — Bank Statement only)
+- bank_statement_ending_balance (number or null, no $ or commas — Bank Statement only)
+- payroll_company_name (string or null — Payroll Summary only)
+- payroll_period (string or null — Payroll Summary only)
+- payroll_total_gross_pay (number or null, no $ or commas — Payroll Summary only)
+- payroll_employee_count (integer or null — Payroll Summary only)
+- ein_letter_entity_name (string or null — EIN Letter only)
+- ein_letter_ein (string or null, format like XX-XXXXXXX — EIN Letter only)
+- ein_letter_date_issued (string or null — EIN Letter only)
+- balance_sheet_company_name (string or null — Balance Sheet only)
+- balance_sheet_as_of_date (string or null — Balance Sheet only)
+- balance_sheet_total_assets (number or null, no $ or commas — Balance Sheet only)
+- balance_sheet_total_liabilities (number or null, no $ or commas — Balance Sheet only)
+- balance_sheet_total_equity (number or null, no $ or commas; may be negative — Balance
+  Sheet only)
+- credit_card_holder_name (string or null — Credit Card Statement only)
+- credit_card_issuer (string or null — Credit Card Statement only)
+- credit_card_last4 (string or null, last 4 digits only — never the full card number —
+  Credit Card Statement only)
+- credit_card_statement_period (string or null — Credit Card Statement only)
+- credit_card_statement_balance (number or null, no $ or commas — Credit Card Statement only)
 
 Set every field that does not apply to the detected document_type, and any field that is
 unreadable or not present on the document, to null rather than guessing. Return valid JSON
@@ -55,7 +101,21 @@ SCHEMA_BY_DOC_TYPE = {
     "1099-MISC": Form1099Misc,
     "W-2": FormW2,
     "K-1": FormK1,
+    "Bank Statement": BankStatement,
+    "Payroll Summary": PayrollSummary,
+    "EIN Letter": EINLetter,
+    "Balance Sheet": BalanceSheet,
+    "Credit Card Statement": CreditCardStatement,
 }
+
+# Doc types with no ledger to reconcile against — see BankStatement's docstring in
+# schemas.py. results_panel.py checks membership in this set directly (rather than inferring
+# "informational" from absence in its own RECONCILERS dict) to render these as
+# classify-and-display instead of running them through reconciliation. Exported so nothing
+# outside this module has to re-derive the list.
+INFORMATIONAL_DOC_TYPES = frozenset(
+    {"Bank Statement", "Payroll Summary", "EIN Letter", "Balance Sheet", "Credit Card Statement"}
+)
 
 # The model returns "W2" (matching FormW2.document_type's own default), but every dispatch
 # key elsewhere in the app (RECONCILERS, sample dict, ledgers) uses "W-2". Normalize here
@@ -67,6 +127,11 @@ _DOC_TYPE_ALIASES = {
     "K1": "K-1",
     "SCHEDULEK1": "K-1",
     "SCHK1": "K-1",
+    "BANKSTATEMENT": "Bank Statement",
+    "PAYROLLSUMMARY": "Payroll Summary",
+    "EINLETTER": "EIN Letter",
+    "BALANCESHEET": "Balance Sheet",
+    "CREDITCARDSTATEMENT": "Credit Card Statement",
 }
 
 
@@ -138,8 +203,9 @@ def extract_and_classify(base64_image: str, timeout: int = config.PROCESSING_TIM
     doc_type = _normalize_doc_type(raw_data.get("document_type"))
     if doc_type not in SCHEMA_BY_DOC_TYPE:
         raise ExtractionError(
-            "Could not identify a supported document type (1099-NEC, 1099-MISC, W-2, or "
-            "Schedule K-1) in this file."
+            "Could not identify a supported document type (1099-NEC, 1099-MISC, W-2, "
+            "Schedule K-1, Bank Statement, Payroll Summary, EIN Letter, Balance Sheet, or "
+            "Credit Card Statement) in this file."
         )
 
     schema_cls = SCHEMA_BY_DOC_TYPE[doc_type]

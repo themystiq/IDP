@@ -16,7 +16,12 @@ def render_upload_panel():
         "Upload one or more 1099-NEC · 1099-MISC · W-2 · Schedule K-1 files (PDF, PNG, or JPG)",
         type=config.ALLOWED_EXTENSIONS,
         accept_multiple_files=True,
-        help=f"Maximum file size per file: {config.MAX_UPLOAD_SIZE_MB}MB",
+        help=(
+            f"Maximum file size per file: {config.MAX_UPLOAD_SIZE_MB}MB. Bank statements, "
+            "credit card statements, payroll summaries, EIN letters, and balance sheets are "
+            "also recognized, but shown as informational only — no reconciliation ledger "
+            "exists for them."
+        ),
     )
 
     documents = []  # each: {"name": str, "images": list[PIL.Image], "base64_images": list[str]}

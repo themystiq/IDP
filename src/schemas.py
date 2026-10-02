@@ -1,4 +1,12 @@
-"""Pydantic schemas for IRS Form 1099-NEC / 1099-MISC / W-2 / Schedule K-1 extraction output.
+"""Pydantic schemas for extraction output.
+
+Form1099NEC / Form1099Misc / FormW2 / FormK1 are the four *reconciled* form types — each has
+a matching ledger and reconcile_<type> function (see reconciliation.py). BankStatement /
+PayrollSummary / EINLetter / BalanceSheet / CreditCardStatement are *informational* document
+types: the model can identify them and pull a few headline fields, but there's no ledger to
+audit them against, so they're classified and displayed as-is rather than run through
+reconciliation — see extraction.py's INFORMATIONAL_DOC_TYPES and results_panel.py's handling
+of doc types in that set.
 
 All fields except document_type are optional: the vision model is instructed to return null
 for anything it can't read rather than guess, and the reconciliation engine handles missing
@@ -68,6 +76,59 @@ class FormW2(BaseModel):
         if v < 0:
             raise ValueError("amount cannot be negative")
         return round(v, 2)
+
+
+class BankStatement(BaseModel):
+    """Informational only — no ledger exists to reconcile a bank statement against, so
+    this (and the three schemas below it) are classify-and-display, not audited."""
+
+    document_type: str = "Bank Statement"
+    bank_statement_holder_name: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_account_last4: Optional[str] = None
+    bank_statement_period: Optional[str] = None
+    bank_statement_ending_balance: Optional[float] = None
+
+
+class PayrollSummary(BaseModel):
+    """Informational only — see BankStatement docstring."""
+
+    document_type: str = "Payroll Summary"
+    payroll_company_name: Optional[str] = None
+    payroll_period: Optional[str] = None
+    payroll_total_gross_pay: Optional[float] = None
+    payroll_employee_count: Optional[int] = None
+
+
+class EINLetter(BaseModel):
+    """Informational only — see BankStatement docstring."""
+
+    document_type: str = "EIN Letter"
+    ein_letter_entity_name: Optional[str] = None
+    ein_letter_ein: Optional[str] = None
+    ein_letter_date_issued: Optional[str] = None
+
+
+class BalanceSheet(BaseModel):
+    """Informational only — see BankStatement docstring."""
+
+    document_type: str = "Balance Sheet"
+    balance_sheet_company_name: Optional[str] = None
+    balance_sheet_as_of_date: Optional[str] = None
+    balance_sheet_total_assets: Optional[float] = None
+    balance_sheet_total_liabilities: Optional[float] = None
+    balance_sheet_total_equity: Optional[float] = None
+
+
+class CreditCardStatement(BaseModel):
+    """Informational only — see BankStatement docstring."""
+
+    document_type: str = "Credit Card Statement"
+    credit_card_holder_name: Optional[str] = None
+    credit_card_issuer: Optional[str] = None
+    credit_card_last4: Optional[str] = None
+    credit_card_statement_period: Optional[str] = None
+    credit_card_statement_balance: Optional[float] = None
 
 
 class FormK1(BaseModel):

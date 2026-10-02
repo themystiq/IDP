@@ -11,10 +11,15 @@ more documents (PDF/PNG/JPG) at once, and for each one the vision LLM both detec
 four supported IRS forms it is — 1099-NEC, 1099-MISC, W-2, or Schedule K-1 — and extracts its
 structured data in one call, no manual document-type selection required. Each result is
 reconciled against an in-memory ledger (General Ledger for 1099-NEC, 1099-MISC ledger,
-payroll ledger for W-2, K-1 ledger for Schedule K-1). The whole batch is shown as three
-summary KPI tiles plus taxpayer-ID-grouped customer cards (a customer with both a W-2 and a
-1099-NEC under the same SSN shows as one card with both documents listed). The UI runs a
-custom dark "executive" theme injected as CSS over Streamlit's own dark base theme.
+payroll ledger for W-2, K-1 ledger for Schedule K-1). The same call also recognizes four
+*informational* document types — Bank Statement, Credit Card Statement, Payroll Summary, EIN
+Letter, Balance Sheet — which have no ledger to reconcile against, so they're classified and
+their headline fields
+displayed, but never audited (see "Informational document types" below). The whole batch is
+shown as three summary KPI tiles plus taxpayer-ID-grouped customer cards (a customer with both
+a W-2 and a 1099-NEC under the same SSN shows as one card with both documents listed) plus,
+when present, a separate list of informational documents. The UI runs a custom dark
+"executive" theme injected as CSS over Streamlit's own dark base theme.
 
 ## Tech stack
 
@@ -25,7 +30,7 @@ custom dark "executive" theme injected as CSS over Streamlit's own dark base the
 | Image handling | Pillow | in-memory PNG re-encoding, base64 |
 | LLM gateway | LiteLLM | provider-agnostic call into `litellm.completion(...)` |
 | Vision model | Claude Sonnet 5 (`anthropic/claude-sonnet-5`) | model id overridable via `CLAUDE_MODEL` env var; must include the `anthropic/` provider prefix for LiteLLM routing |
-| Schema validation | Pydantic v2 | `Form1099NEC`, `Form1099Misc`, `FormW2`, `FormK1` — per-form-type extraction contracts, all fields optional except `document_type` |
+| Schema validation | Pydantic v2 | `Form1099NEC`, `Form1099Misc`, `FormW2`, `FormK1` (reconciled) plus `BankStatement`, `CreditCardStatement`, `PayrollSummary`, `EINLetter`, `BalanceSheet` (informational-only) — per-type extraction contracts, all fields optional except `document_type` |
 | Reconciliation | Pandas | in-memory DataFrame match/variance logic |
 | Config | python-dotenv | loads `.env`, never hardcoded |
 | Theme | `.streamlit/config.toml` (`base = "dark"`) + custom CSS | dark palette set at both the Streamlit-theme level and via injected CSS — see `src/ui/theme.py` |
@@ -37,7 +42,7 @@ app.py                     # Streamlit entry point — wires panels together, no
 src/
   config.py                # env/config loading (API key, model, timeout, size limits)
   exceptions.py             # IDPBaseError hierarchy, caught at the UI boundary
-  schemas.py                 # Form1099NEC, Form1099Misc, FormW2, FormK1 Pydantic models
+  schemas.py                 # Form1099NEC, Form1099Misc, FormW2, FormK1 (reconciled) + BankStatement, CreditCardStatement, PayrollSummary, EINLetter, BalanceSheet (informational) Pydantic models
   document_processor.py      # PyMuPDF page-to-image rendering + base64 encoding
   extraction.py               # LiteLLM + Claude vision: one call classifies doc type AND extracts fields, timeout
   reconciliation.py            # Pandas engines: reconcile_1099_nec, reconcile_1099_misc, reconcile_w2, reconcile_k1
@@ -60,6 +65,19 @@ a `reconcile_<type>` function + ledger in `reconciliation.py`/`ledger_data.py`; 
 `box_label` (short label for the detail table's "Box" column). There is no UI selector to
 update — the model has to be able to tell the new type apart from the existing ones based on
 the image alone. Schedule K-1 (`FormK1`) is the reference example for all of this.
+
+**Adding a new *informational* type** (one with no ledger to reconcile against — the current
+five are Bank Statement, Credit Card Statement, Payroll Summary, EIN Letter, Balance Sheet) is a smaller version of
+the above: a schema in `schemas.py` (field names prefixed per-type, e.g. `bank_statement_*`,
+to avoid flat-JSON collisions across types — see the module docstring there), a field block
+in `UNIFIED_EXTRACTION_PROMPT` plus `SCHEMA_BY_DOC_TYPE`/`INFORMATIONAL_DOC_TYPES`/
+`_DOC_TYPE_ALIASES` entries in `extraction.py`, and an `INFO_FIELDS` entry in
+`results_panel.py` (`subject` + a `fields` list of `(label, attr)` pairs — no `reconcile`/
+`ledger`/`tin`/`payer` keys, since `RECONCILERS` is specifically the dispatch table for
+*audited* types; `results_panel.py` checks `doc_type not in RECONCILERS` to treat a type as
+informational rather than maintaining a second parallel "is this reconciled" list). No
+`reconcile_<type>` function or ledger needed. Bank Statement (`BankStatement`) is the
+reference example.
 
 Design principles:
 - **Thin `app.py`.** All logic lives in `src/`; `app.py` only composes the three UI panels.
@@ -171,6 +189,18 @@ Design principles:
   `XXX-XX-XXXX`), not digit count — both are 9 digits, so counting alone can't tell them
   apart, and doing so once caused every business EIN to render in the personal SSN shape
   (`***-**-1234`) instead of its own (`**-***1234`). Don't go back to a digit-count-only check.
+- **Informational document types never reach `_group_by_taxpayer` or the Customer
+  Reconciliation cards at all.** A Bank Statement / Credit Card Statement / Payroll Summary /
+  EIN Letter / Balance Sheet (see "Adding a new informational type" above) has no
+  `RECONCILERS` entry — no `tin`/`subject` accessor to call — so `_group_by_taxpayer`
+  explicitly skips any doc whose `doc_type in INFORMATIONAL_DOC_TYPES`, and
+  `render_results_panel` renders them instead in their own
+  "📋 Other Identified Documents (not reconciled)" list (driven by `INFO_FIELDS`), right below
+  the "⚠️ Failed to Process" list and above the Customer Reconciliation section. Their
+  `reconciliation` key is `None` on the `_process_document` outcome dict — by design, not an
+  error — so every place that reads `r["reconciliation"]` (KPI counts, CSV export, the
+  workflow indicator) treats `None` as "not applicable" rather than crashing on it or
+  double-counting it as a failure.
 - **The customer card badge (`_customer_badge`) shows every nonzero count side by side:**
   `🟢 {green} Match(es)`, `🟡 {amber} Compliance Notice(s)`, `🔴 {red} Variance(s)`, joined with
   `" | "` for a taxpayer with a mix — e.g. someone with one clean W-2 and one discrepant
@@ -221,6 +251,10 @@ Design principles:
     non-`GREEN` status — reusing the same status semantics as the KPI cards and Customer
     Detail badges. It's `"failed"` (red) only when *nothing* in the batch reached
     reconciliation at all (total failure), not merely when some documents have variances.
+    A batch made entirely of informational doc types (see above) has zero reconciled
+    documents by design, not by failure — so this stage also checks whether anything
+    extracted successfully with `reconciliation is None` (an `informational_count`) before
+    calling it `"failed"`, and only reds out when neither count is nonzero.
   - **The "next actionable" stage** (hollow dot with a `--idp-accent-info` blue ring, not
     filled) only ever applies to "Extracted," and only in the gap between files being loaded
     and the Extract button being clicked — the one point in this app's workflow where a
