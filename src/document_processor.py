@@ -7,6 +7,15 @@ from PIL import Image
 
 from src.exceptions import DocumentProcessingError
 
+# Anthropic's own vision docs recommend capping the long edge at 1568px — anything larger
+# gets resized server-side anyway before Claude ever looks at it. Re-encoding an uploaded
+# photo (e.g. a 12MP phone-camera JPEG, comfortably under the app's 10MB upload guardrail)
+# as a *lossless* PNG at full resolution can inflate the base64 payload to 30-40MB, which
+# blows past Anthropic's request-size limit (`request_too_large`) even though the original
+# upload was well within bounds. Downscaling before encoding fixes this without any quality
+# loss, since Claude would've downsampled it anyway.
+MAX_VISION_DIMENSION = 1568
+
 
 def render_upload_to_images(file_bytes: bytes, filename: str, dpi: int = 200) -> list[Image.Image]:
     """Render an uploaded PDF/image into a list of PIL images, one per page."""
@@ -37,7 +46,13 @@ def render_upload_to_images(file_bytes: bytes, filename: str, dpi: int = 200) ->
 
 
 def image_to_base64_png(image: Image.Image) -> str:
-    """Encode a PIL image as a base64 PNG string for the LiteLLM vision payload."""
+    """Encode a PIL image as a base64 PNG string for the LiteLLM vision payload.
+
+    Downscales to MAX_VISION_DIMENSION on the long edge first — see that constant's
+    comment for why this matters beyond just saving bandwidth."""
+    rgb_image = image.convert("RGB")
+    if max(rgb_image.size) > MAX_VISION_DIMENSION:
+        rgb_image.thumbnail((MAX_VISION_DIMENSION, MAX_VISION_DIMENSION), Image.LANCZOS)
     buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
+    rgb_image.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
