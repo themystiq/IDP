@@ -11,7 +11,11 @@ boundaries — don't conflate them:
 - `post_chaser_email` (Document Chaser): posts a drafted client reminder email, which by
   its nature names the client and the document types they're missing — a deliberately wider
   boundary than the IDP notification above, scoped to this one feature. Still never includes
-  a TIN/SSN/EIN or a dollar amount. See CLAUDE.md's Document Chaser section.
+  a TIN/SSN/EIN or a dollar amount. The message includes "✏️ Edit" / "✅ Approve & Send" link
+  buttons (Slack Block Kit, `url`-type — no Slack Interactivity/signing-secret setup needed,
+  they just open a browser tab) pointing back at this client's card in the Streamlit app,
+  since the actual edit/send action still happens there, not in Slack itself. See CLAUDE.md's
+  Document Chaser section.
 
 Both are optional and never block their pipeline: a missing token/channel, a network error,
 or the bot not being invited to the target channel all surface as a quiet return value for
@@ -35,12 +39,16 @@ def slack_enabled() -> bool:
     return bool(config.SLACK_BOT_TOKEN and config.SLACK_CHANNEL)
 
 
-def _post(text: str) -> tuple[bool, str]:
-    """Shared best-effort post: never raises, returns (sent, error_message)."""
+def _post(text: str, blocks: list = None) -> tuple[bool, str]:
+    """Shared best-effort post: never raises, returns (sent, error_message). `text` is
+    always sent as the fallback (notifications, accessibility); `blocks` — when given —
+    is the rich Block Kit rendering Slack actually displays."""
     if not slack_enabled():
         return False, "Slack not configured (set SLACK_BOT_TOKEN and SLACK_CHANNEL in .env)."
     try:
-        WebClient(token=config.SLACK_BOT_TOKEN).chat_postMessage(channel=config.SLACK_CHANNEL, text=text)
+        WebClient(token=config.SLACK_BOT_TOKEN).chat_postMessage(
+            channel=config.SLACK_CHANNEL, text=text, blocks=blocks
+        )
         return True, ""
     except SlackApiError as e:
         return False, e.response.get("error", str(e))
@@ -58,8 +66,32 @@ def notify_document_outcome(doc_name: str, doc_type: str, status_key: str, detai
     return _post(text)
 
 
-def post_chaser_email(client_name: str, subject: str, body: str) -> tuple[bool, str]:
-    """Post a drafted Document Chaser reminder email as one Slack message — a fenced code
-    block for the body so line breaks render readably."""
+def post_chaser_email(client_name: str, folder: str, subject: str, body: str) -> tuple[bool, str]:
+    """Post a drafted Document Chaser reminder email as one Slack message, with "Edit" /
+    "Approve & Send" link buttons pointing back at this client's card in the app
+    (`APP_BASE_URL/?tab=chaser&client=<folder>` — see app.py/chaser_panel.py for how that
+    query param is read). These are plain `url` buttons, not Slack's interactive
+    `action_id` kind — clicking one just opens that URL in a browser, no Request URL /
+    signing secret / webhook receiver needed on our side."""
     text = f"📧 *Document Chaser — {client_name}*\n*Subject:* {subject}\n```{body}```"
-    return _post(text)
+    app_url = f"{config.APP_BASE_URL}/?tab=chaser&client={folder}"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    "url": app_url,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve & Send"},
+                    "url": app_url,
+                    "style": "primary",
+                },
+            ],
+        },
+    ]
+    return _post(text, blocks=blocks)

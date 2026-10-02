@@ -36,6 +36,11 @@ SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")
 # addresses. Remove/generalize once clients have real addresses to send to.
 CHASER_EMAIL_OVERRIDE = os.getenv("CHASER_EMAIL_OVERRIDE", "ramya.rajaram@mystiqlabs.ai")
 
+# Where the running app can be reached from a browser — used to build the "Edit" / "Approve
+# & Send" link buttons on a Document Chaser Slack post (see slack_notifier.post_chaser_email).
+# Defaults to local dev; set to a real deployed URL once this app is hosted somewhere.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8501")
+
 MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 

@@ -49,7 +49,8 @@ def _run_batch() -> list[dict]:
 
             if slack_enabled():
                 sent, err = post_chaser_email(
-                    result["client_name"], result["email"]["subject"], result["email"]["body"]
+                    result["client_name"], client["folder"],
+                    result["email"]["subject"], result["email"]["body"],
                 )
                 result["slack_sent"] = sent
                 result["slack_error"] = err
@@ -68,6 +69,15 @@ def _run_batch() -> list[dict]:
 
 
 def render_chaser_panel() -> None:
+    # Landing here via a Slack "Edit"/"Approve & Send" link button (see
+    # slack_notifier.post_chaser_email) carries ?client=<folder> — force that one card open
+    # so the user doesn't have to hunt for it. Streamlit's st.tabs() has no way to select the
+    # active tab programmatically, so the user still has to click the "Document Chaser" tab
+    # once themselves; this just saves the second step of finding the right card.
+    requested_client = st.query_params.get("client")
+    if requested_client in {c["folder"] for c in CLIENT_CHECKLISTS}:
+        st.session_state[f"chaser_expanded_{requested_client}"] = True
+
     st.subheader("📋 Document Chaser")
     st.caption(
         "Scans each client's folder, extracts and classifies every document found, and "

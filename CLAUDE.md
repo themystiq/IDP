@@ -443,6 +443,22 @@ Design notes:
   shared by both functions (factored out of what used to be `notify_document_outcome`'s
   inline `WebClient` call) so the actual Slack API call and its best-effort/non-raising
   contract can't drift between the two message types.
+- **The Slack message's "Edit"/"Approve & Send" buttons are link buttons, not Slack
+  Interactivity — a deliberate scope decision.** Real Slack Interactivity (a button whose
+  click is handled server-side, in-place, without leaving Slack) needs the Slack app's
+  Signing Secret, a public HTTPS Request URL, and a webhook receiver to verify and handle
+  the callback — a meaningful chunk of new infrastructure. Instead, `post_chaser_email`
+  builds a Block Kit `actions` block with two `url`-type buttons (see
+  `slack_notifier.post_chaser_email`), each pointing at
+  `{config.APP_BASE_URL}/?tab=chaser&client=<folder>` — clicking either just opens that URL
+  in a browser; Slack needs nothing special configured for this (`url` buttons aren't
+  Slack's interactive-component kind). `chaser_panel.py`'s `render_chaser_panel` reads
+  `st.query_params.get("client")` at the top and force-sets that one client's
+  `chaser_expanded_<folder>` flag, so the linked card is already open when the page loads.
+  **Known limitation:** `st.tabs()` has no API to select the active tab programmatically, so
+  the user still has to click the "Document Chaser" tab once themselves after landing — the
+  query param only saves hunting for the right card once there. If real one-click
+  Interactivity is wanted later, that's the documented harder path, not implemented here.
 - **One Slack post per client, fired as that client's scan finishes** — `chaser_panel.py`'s
   `_run_batch` loops over `CLIENT_CHECKLISTS` and calls `post_chaser_email` right after each
   client's `run_chaser_for_client` call, rather than collecting every result first and
@@ -629,9 +645,9 @@ python -m py_compile app.py src/*.py src/ui/*.py
 
 - **Credentials load from environment only.** `src/config.py` reads `ANTHROPIC_API_KEY`,
   `CLAUDE_MODEL`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL`, `SMTP_HOST`, `SMTP_PORT`,
-  `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, and `CHASER_EMAIL_OVERRIDE` via
-  `python-dotenv` / `os.getenv`. Never add a raw API key/token/password text input to the
-  UI, never hardcode one, never log one.
+  `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `CHASER_EMAIL_OVERRIDE`, and
+  `APP_BASE_URL` via `python-dotenv` / `os.getenv`. Never add a raw API key/token/password
+  text input to the UI, never hardcode one, never log one.
 - **`.env` is gitignored.** Only `.env.example` (placeholder values) is committed.
 - **Nothing is persisted outside `st.session_state`, but there are now three deliberate,
   narrowly-scoped outbound calls — not one.** Uploaded documents, rendered images, extracted
