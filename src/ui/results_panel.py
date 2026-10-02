@@ -9,6 +9,7 @@ import io
 import json
 import re
 import time
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +28,7 @@ from src.reconciliation import (
     reconcile_k1,
     reconcile_w2,
 )
+from src.slack_notifier import notify_document_outcome, slack_enabled
 
 # Display metadata for the four *informational* doc types (see extraction.py's
 # INFORMATIONAL_DOC_TYPES / schemas.py's BankStatement docstring) — no "reconcile"/"ledger"
@@ -150,6 +152,22 @@ def _process_document(doc: dict) -> dict:
 
 def _currency(value) -> str:
     return f"${value:,.2f}" if value is not None else "N/A"
+
+
+def _notify_slack_outcome(outcome: dict) -> Optional[str]:
+    """Fire one Slack notification for a just-processed document (see slack_notifier.py).
+    Returns an error string if the send failed (for the caller to surface in the UI), or
+    None if it was skipped (Slack unconfigured) or succeeded."""
+    if not slack_enabled():
+        return None
+    if outcome["error"]:
+        status_key = "ERROR"
+    elif outcome["reconciliation"] is None:
+        status_key = "INFO"
+    else:
+        status_key = outcome["reconciliation"]["status"]
+    sent, err = notify_document_outcome(outcome["doc_name"], outcome["doc_type"], status_key)
+    return None if sent else err
 
 
 def _kpi_card(accent: str, label: str, value: str) -> str:
@@ -350,9 +368,28 @@ def render_results_panel(extract_clicked: bool, documents: list) -> None:
             f"Detecting document type & extracting data for {len(documents)} document(s)..."
         ):
             start = time.time()
-            st.session_state["batch_results"] = [_process_document(doc) for doc in documents]
+            # Notified one document at a time, right as each one finishes processing —
+            # not batched into a single end-of-run Slack message — so a Slack alert for the
+            # first document in a large batch doesn't wait on every later one.
+            results = []
+            slack_errors = []
+            for doc in documents:
+                outcome = _process_document(doc)
+                results.append(outcome)
+                slack_err = _notify_slack_outcome(outcome)
+                if slack_err:
+                    slack_errors.append(f"{outcome['doc_name']}: {slack_err}")
+            st.session_state["batch_results"] = results
+            st.session_state["slack_errors"] = slack_errors
             elapsed = time.time() - start
         st.caption(f"Processed {len(documents)} document(s) in {elapsed:.1f}s")
+        if slack_enabled() and st.session_state.get("slack_errors"):
+            st.warning(
+                f"⚠️ {len(st.session_state['slack_errors'])} Slack notification(s) failed to "
+                "send — check SLACK_BOT_TOKEN/SLACK_CHANNEL and that the bot is invited to "
+                "the channel.",
+                icon="⚠️",
+            )
 
     batch_results = st.session_state.get("batch_results")
 

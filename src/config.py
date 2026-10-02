@@ -12,6 +12,14 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # flagship Sonnet vision model. Override via CLAUDE_MODEL if your account should use another.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5")
 
+# Optional: per-document audit-outcome notifications (see src/slack_notifier.py). Both must
+# be set for notifications to fire; if either is blank, slack_notifier.slack_enabled()
+# returns False and the app behaves exactly as it did before Slack was added. SLACK_CHANNEL
+# is a channel ID (e.g. "C0123456789") or name (e.g. "#gl-recon-alerts") — the bot must also
+# be invited to that channel, or Slack returns a "not_in_channel" error.
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
+
 MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 

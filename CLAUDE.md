@@ -34,6 +34,7 @@ when present, a separate list of informational documents. The UI runs a custom d
 | Reconciliation | Pandas | in-memory DataFrame match/variance logic |
 | Config | python-dotenv | loads `.env`, never hardcoded |
 | Theme | `.streamlit/config.toml` (`base = "dark"`) + custom CSS | dark palette set at both the Streamlit-theme level and via injected CSS — see `src/ui/theme.py` |
+| Notifications | `slack_sdk` (`WebClient.chat_postMessage`) | optional, best-effort per-document Slack post — see `src/slack_notifier.py` and the security note below |
 
 ## Architecture
 
@@ -48,6 +49,7 @@ src/
   reconciliation.py            # Pandas engines: reconcile_1099_nec, reconcile_1099_misc, reconcile_w2, reconcile_k1
   ledger_data.py                # in-memory sample General Ledger + 1099-MISC ledger + payroll ledger + K-1 ledger DataFrames
   sample_documents.py            # fills the real IRS templates in documents/ with sample client data (see below)
+  slack_notifier.py               # optional, best-effort per-document Slack post of doc name/type/audit status
   ui/
     theme.py                       # dark "executive" CSS injected once from app.py
     sidebar.py                    # branding, engine status, compliance notice, sample loader
@@ -301,6 +303,22 @@ Design principles:
   third export action (e.g. "Export Audit Report") can join as a third `st.columns()` entry
   without restructuring this section — don't add it speculatively, only when that
   functionality actually exists.
+- **Slack notifications fire per-document, inside the processing loop — not once per
+  batch.** `render_results_panel`'s extract-button handler used to build `batch_results` with
+  a single list comprehension (`[_process_document(doc) for doc in documents]`); it's now an
+  explicit `for` loop so `_notify_slack_outcome` can run immediately after each document's
+  `_process_document` call, before the next document starts. This means a CPA watching the
+  Slack channel sees each result as it lands rather than all of them at once after the whole
+  batch finishes — meaningful for a large batch under the existing 30s-per-document timeout
+  (see the Security section's per-document timeout note). The status label sent
+  (`_STATUS_DISPLAY` in `slack_notifier.py`) reuses the same five-way vocabulary as everywhere
+  else in the UI: Clean Match / Compliance Notice / Variance / Informational — Not Reconciled
+  (for `doc_type in INFORMATIONAL_DOC_TYPES`) / Failed to Process (for a document whose
+  `"error"` key is set). Slack failures are collected into
+  `st.session_state["slack_errors"]` and surfaced as one `st.warning` summary (count only,
+  not per-document) right under the "Processed N document(s) in Xs" caption — not inline per
+  document, to avoid interleaving an infrastructure concern with the audit-flag callouts
+  later in the page.
 - **One call, not two.** Classification and field extraction happen in a single LiteLLM
   request (`UNIFIED_EXTRACTION_PROMPT` lists every field across all three forms and tells the
   model to null out whatever doesn't apply to the type it detects), rather than a cheap
@@ -472,7 +490,8 @@ Design notes:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in ANTHROPIC_API_KEY
+cp .env.example .env   # then fill in ANTHROPIC_API_KEY (required) and, optionally,
+                        # SLACK_BOT_TOKEN/SLACK_CHANNEL for per-document Slack alerts
 
 # run the app
 streamlit run app.py
@@ -497,19 +516,32 @@ python -m py_compile app.py src/*.py src/ui/*.py
 
 ## Security & execution handling rules
 
-- **Credentials load from environment only.** `src/config.py` reads `ANTHROPIC_API_KEY` and
-  `CLAUDE_MODEL` via `python-dotenv` / `os.getenv`. Never add a raw API key text input to the
-  UI, never hardcode a key, never log a key.
+- **Credentials load from environment only.** `src/config.py` reads `ANTHROPIC_API_KEY`,
+  `CLAUDE_MODEL`, `SLACK_BOT_TOKEN`, and `SLACK_CHANNEL` via `python-dotenv` / `os.getenv`.
+  Never add a raw API key/token text input to the UI, never hardcode one, never log one.
 - **`.env` is gitignored.** Only `.env.example` (placeholder values) is committed.
-- **Nothing is persisted.** Uploaded documents, rendered images, extracted PII/TINs, and
-  reconciliation results live only in `st.session_state` for the life of the browser session.
-  There is no disk write, database, or external storage call anywhere in `src/`. If you add
-  one, update the sidebar's privacy card wording (`.idp-privacy-card` markup in
-  `src/ui/sidebar.py`, styled in `theme.py`) to match reality — it's a compact custom HTML
-  card, not a native `st.info`, precisely so its size/typography could be tuned independently
-  of every other alert in the app. Keep the wording short (title + one-line italic subtitle +
-  one short sentence) — it was deliberately condensed from a taller `st.info` paragraph, and
-  ballooning it back into a paragraph defeats the point of the redesign.
+- **Nothing is persisted, with one deliberate, narrow exception: Slack.** Uploaded documents,
+  rendered images, extracted PII/TINs, and reconciliation results live only in
+  `st.session_state` for the life of the browser session — no disk write, database, or
+  external storage call for any of that. The one outbound call in `src/` is
+  `slack_notifier.notify_document_outcome` (see `src/slack_notifier.py`, wired into
+  `results_panel.py`'s per-document processing loop), and it's scoped tightly on purpose:
+  **only** the document's filename, detected type, and audit status label (Clean Match /
+  Compliance Notice / Variance / Informational / Failed) ever leave the app. It never sends
+  the TIN/SSN/EIN, recipient/employee/partner name, dollar amounts, or any other extracted
+  field — see that module's docstring for the exact boundary. Slack is optional
+  (`slack_notifier.slack_enabled()` is `False`, and nothing is sent, unless both
+  `SLACK_BOT_TOKEN` and `SLACK_CHANNEL` are set) and best-effort: a failed send (bad token,
+  bot not invited to the channel, network error) is caught inside `slack_notifier.py`,
+  surfaced as a `st.warning` summary in `results_panel.py`, and never raises — it can't
+  interrupt extraction or reconciliation for the rest of the batch. If you widen what gets
+  sent, or add another outbound integration, update the sidebar's privacy card wording
+  (`.idp-privacy-card` markup in `src/ui/sidebar.py`, styled in `theme.py`) to match reality —
+  it's a compact custom HTML card, not a native `st.info`, precisely so its size/typography
+  could be tuned independently of every other alert in the app. Keep the wording short (title
+  + one-line italic subtitle + one short sentence) — it was deliberately condensed from a
+  taller `st.info` paragraph, and ballooning it back into a paragraph defeats the point of the
+  redesign.
 - **Upload size is enforced twice:** `.streamlit/config.toml` (`server.maxUploadSize = 10`)
   caps it at the platform level, and `upload_panel.py` re-checks `uploaded_file.size` against
   `config.MAX_UPLOAD_SIZE_BYTES` so the limit holds even if the config file is later changed.
@@ -584,3 +616,10 @@ python -m py_compile app.py src/*.py src/ui/*.py
   loader, both samples need loading and extracting one at a time in the same session — the
   loader itself wasn't extended to multi-select. Real multi-file upload already supports this.
 - No automated test suite yet.
+- Slack notifications are sent synchronously, one `chat.postMessage` call per document,
+  inline in the same extraction loop (see the "Slack notifications fire per-document" design
+  note above) — a slow or unreachable Slack API adds that latency directly to each document's
+  processing time (though a failure itself doesn't raise/block, per `slack_notifier.py`'s
+  design). No retry, queue, or batching. Fine for this demo's single-user scope; revisit
+  (e.g. fire-and-forget via a background thread) if batches grow large or Slack reliability
+  becomes a problem.

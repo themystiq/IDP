@@ -23,7 +23,8 @@ def render_sidebar() -> None:
             '<div class="idp-privacy-subtitle">Privacy-first processing</div>'
             '<div class="idp-privacy-desc">Processed <strong>transiently in memory</strong> — '
             "no documents, PII, TINs/EINs, or financial data are "
-            "<strong>ever persisted</strong>.</div>"
+            "<strong>ever persisted</strong> or sent anywhere, aside from an optional Slack "
+            "alert carrying only the filename and audit status.</div>"
             "</div>",
             unsafe_allow_html=True,
         )
