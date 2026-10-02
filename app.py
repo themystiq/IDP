@@ -5,6 +5,7 @@ All business logic lives in src/ (see CLAUDE.md for architecture and run instruc
 """
 import streamlit as st
 
+from src.ui.chaser_panel import render_chaser_panel
 from src.ui.results_panel import render_results_panel
 from src.ui.sidebar import render_sidebar
 from src.ui.theme import inject_custom_theme
@@ -26,10 +27,16 @@ st.caption(
     "Schedule K-1"
 )
 
-left, right = st.columns([1, 1.4], gap="large")
+tab_idp, tab_chaser = st.tabs(["🧾 IDP & Reconciliation", "📋 Document Chaser"])
 
-with left:
-    extract_clicked, documents = render_upload_panel()
+with tab_idp:
+    left, right = st.columns([1, 1.4], gap="large")
 
-with right:
-    render_results_panel(extract_clicked, documents)
+    with left:
+        extract_clicked, documents = render_upload_panel()
+
+    with right:
+        render_results_panel(extract_clicked, documents)
+
+with tab_chaser:
+    render_chaser_panel()

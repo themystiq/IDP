@@ -340,6 +340,84 @@ Design principles:
   doesn't look like a supported form — this is the one new failure mode auto-detection
   introduced that didn't exist when the user picked the type manually.
 
+## Document Chaser
+
+A second, related workflow in its own top-level tab (`app.py`'s `st.tabs(["🧾 IDP & Reconciliation", "📋 Document Chaser"])`)
+— previews what will later become a standalone "document chaser agent." Rather than a human
+uploading one document at a time, it scans a fixed roster of client folders, extracts and
+classifies whatever's in each one, compares that against a per-client checklist of required
+documents, and drafts + posts a reminder email to Slack for anything missing or wrong.
+
+```
+src/
+  chaser_data.py        # CLIENT_CHECKLISTS (client name, folder, [{doc_type, expected_subject}]) + client_folder_path()
+  chaser_fixtures.py     # regenerates documents/clients/*/*.pdf — run via `python -m src.chaser_fixtures`
+  document_chaser.py      # scan_client_folder, _match_checklist, compose_reminder_email, run_chaser_for_client
+  ui/
+    chaser_panel.py          # the "Check Documents & Email Clients" button + per-client result cards
+documents/clients/<Folder>/   # one real directory per client, checked into git (synthetic demo data, no real PII —
+                               # same justification as documents/*.pdf) — Rachel_Green/ is deliberately empty (.gitkeep)
+```
+
+Design notes:
+- **Reuses the IDP extraction pipeline verbatim — no parallel extraction code.**
+  `scan_client_folder` in `document_chaser.py` calls the exact same
+  `document_processor.render_upload_to_images` / `image_to_base64_png` →
+  `extraction.extract_and_classify` chain that `upload_panel.py`/`results_panel.py` already
+  use, just fed from `Path.read_bytes()` instead of an `UploadedFile`. A per-file
+  `ExtractionError`/`ExtractionTimeoutError` is caught individually (same resilience pattern
+  as `_process_document`), so one bad file can't abort the rest of a client's folder, or the
+  rest of the batch.
+- **A checklist item can be "missing" or "mismatched" — not just present/absent.** Each
+  `CLIENT_CHECKLISTS` entry in `chaser_data.py` pairs a `doc_type` with an
+  `expected_subject` (the name that should be on it). `document_chaser._match_checklist`
+  looks for an extracted document of that `doc_type`; if none exists, the item is
+  `"missing"`. If one exists but its identity field (`_SUBJECT_ATTR[doc_type]` —
+  `recipient_name` for 1099-NEC/MISC, `employee_name` for W-2, `partner_name` for K-1)
+  doesn't case-insensitively match `expected_subject`, it's `"mismatched"` — the right kind
+  of form, filed under the wrong client. This is the whole point of the demo fixture roster
+  (see below): a chaser that only checked "does a file exist" couldn't catch this.
+  `_SUBJECT_ATTR` intentionally duplicates (in 4 lines) the "subject" lambdas already in
+  `results_panel.RECONCILERS`, rather than importing a UI module from this business-logic
+  one — don't go reach into `results_panel.py` from here to deduplicate it.
+- **The four demo clients are a deliberately-built scenario matrix, not arbitrary sample
+  data.** Each reuses an *existing* identity from `sample_documents._SAMPLE_SPECS` (no new
+  synthetic client data was invented): **John Doe** (1099-NEC + W-2, both correct — the
+  complete case; also the one existing identity that already spans two doc types, since the
+  original IDP sample set used him to demo TIN-based grouping), **Jane Smith** (checklist
+  asks for K-1 + 1099-NEC, folder only has the K-1 — the partial case), **Sam Whitfield**
+  (checklist wants his own W-2, folder actually has **Jordan Ellis's** W-2 — the wrong-client
+  case), **Rachel Green** (checklist wants a W-2, folder is empty — the none-received case).
+  `chaser_fixtures.py`'s `_FOLDER_CONTENTS` is the single source of truth for which
+  `build_sample(doc_type, label)` call fills each folder; re-run
+  `python -m src.chaser_fixtures` any time that mapping changes. Each fixture file is named
+  by its checklist slot (e.g. `W-2.pdf`), not its true contents — the filename itself gives
+  no hint that Sam Whitfield's W-2 is wrong; only extraction reveals it, which is the
+  demo's point.
+- **The reminder email is drafted and posted to Slack — no real email is sent (yet).**
+  `document_chaser.compose_reminder_email` returns a plain `{"subject", "body"}` dict;
+  `chaser_panel.py` always shows that draft in a `st.text_area` regardless of Slack being
+  configured, and additionally calls `slack_notifier.post_chaser_email` when
+  `slack_enabled()`. Sending a *real* email (SMTP/provider integration) was explicitly
+  deferred by the user as a follow-up phase — don't build it speculatively.
+- **`post_chaser_email` is a deliberately wider Slack privacy boundary than
+  `notify_document_outcome`, and the two are documented separately in
+  `slack_notifier.py`'s module docstring because of it.** The IDP workflow's Slack message
+  never includes a name (just filename/type/status); a chaser reminder email *is* a message
+  to a named client about named missing documents, so the client's name and the
+  missing/mismatched doc types necessarily appear in what gets posted. It still never
+  includes a TIN/SSN/EIN or a dollar amount. `slack_notifier.py`'s `_post(text)` helper is
+  shared by both functions (factored out of what used to be `notify_document_outcome`'s
+  inline `WebClient` call) so the actual Slack API call and its best-effort/non-raising
+  contract can't drift between the two message types.
+- **One Slack post per client, fired as that client's scan finishes** — `chaser_panel.py`'s
+  `_run_batch` loops over `CLIENT_CHECKLISTS` and calls `post_chaser_email` right after each
+  client's `run_chaser_for_client` call, rather than collecting every result first and
+  posting once at the end. Same per-item-as-you-go pattern as the IDP workflow's
+  `_notify_slack_outcome` loop in `results_panel.py`, for the same reason — a CPA watching
+  Slack sees each client's status as it's determined, not all at once after the whole roster
+  finishes. A client with nothing outstanding (John Doe, today) gets no Slack message at all.
+
 ## Theming
 
 A single dark "executive" theme, set at two levels that need to stay in sync:
@@ -623,3 +701,14 @@ python -m py_compile app.py src/*.py src/ui/*.py
   design). No retry, queue, or batching. Fine for this demo's single-user scope; revisit
   (e.g. fire-and-forget via a background thread) if batches grow large or Slack reliability
   becomes a problem.
+- **Document Chaser has a fixed, hardcoded roster of 4 clients** (`chaser_data.CLIENT_CHECKLISTS`)
+  — no UI to add/edit a client or their checklist, no persistence of chaser results across a
+  session restart (same session-state-only lifetime as the rest of the app). Fine for the
+  current demo scope; would need a real client/checklist data store to go further.
+- **Document Chaser drafts and posts to Slack, but doesn't send a real email yet** — the
+  user has explicitly flagged real email sending (via Slack, per their own phrasing) as the
+  next phase once this is confirmed working. Not implemented.
+- **Document Chaser re-extracts every file in every client folder on every click** of "Check
+  Documents & Email Clients" — no caching keyed on file content/mtime, so re-running the scan
+  re-spends a full Claude vision call per file every time, same per-document ~30s timeout
+  budget as the main IDP workflow. Fine for 4 small demo folders; would need caching to scale.
