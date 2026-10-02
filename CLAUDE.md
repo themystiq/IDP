@@ -35,6 +35,7 @@ when present, a separate list of informational documents. The UI runs a custom d
 | Config | python-dotenv | loads `.env`, never hardcoded |
 | Theme | `.streamlit/config.toml` (`base = "dark"`) + custom CSS | dark palette set at both the Streamlit-theme level and via injected CSS — see `src/ui/theme.py` |
 | Notifications | `slack_sdk` (`WebClient.chat_postMessage`) | optional, best-effort per-document Slack post — see `src/slack_notifier.py` and the security note below |
+| Email | `smtplib`/`ssl`/`email` (stdlib) | optional, best-effort real send for Document Chaser's "Approve & Send" — see `src/email_sender.py`; generic SMTP, provider-agnostic |
 
 ## Architecture
 
@@ -394,12 +395,44 @@ Design notes:
   by its checklist slot (e.g. `W-2.pdf`), not its true contents — the filename itself gives
   no hint that Sam Whitfield's W-2 is wrong; only extraction reveals it, which is the
   demo's point.
-- **The reminder email is drafted and posted to Slack — no real email is sent (yet).**
-  `document_chaser.compose_reminder_email` returns a plain `{"subject", "body"}` dict;
-  `chaser_panel.py` always shows that draft in a `st.text_area` regardless of Slack being
-  configured, and additionally calls `slack_notifier.post_chaser_email` when
-  `slack_enabled()`. Sending a *real* email (SMTP/provider integration) was explicitly
-  deferred by the user as a follow-up phase — don't build it speculatively.
+- **The reminder email is drafted, posted to Slack automatically, and only sent for real
+  after an explicit human approval.** `document_chaser.compose_reminder_email` returns a
+  plain `{"subject", "body"}` dict; `_run_batch` in `chaser_panel.py` always posts that draft
+  to Slack (when `slack_enabled()`) as soon as a client's scan finishes, same as before. The
+  draft is then also shown in the UI as two editable fields — `st.text_input("Subject", ...)`
+  and `st.text_area("Body", ...)`, both key-bound directly to per-client session-state
+  entries (`chaser_subject_<folder>` / `chaser_body_<folder>`) — behind two buttons:
+  **✏️ Edit** (flips those fields from disabled/read-only to editable; the default on a fresh
+  draft is *disabled*, so a reviewer sees the system's own wording first) and
+  **✅ Approve & Send** (calls `email_sender.send_email` with whatever is *currently* in
+  those two fields — edited or not — then locks both buttons and both fields by setting that
+  client's `chaser_sent_<folder>` flag). Re-running "Check Documents & Email Clients" resets
+  every client's subject/body/editing/sent state back to a fresh draft — see `_run_batch`.
+- **`src/email_sender.py` is the real-send counterpart to `slack_notifier.py`** — same
+  best-effort/non-raising shape (`email_enabled()` gate, `send_email(to, subject, body) ->
+  (sent, error)`), but plain `smtplib`/`ssl`/`email.message.EmailMessage` from the standard
+  library, not a third-party SDK. `config.py`'s `SMTP_HOST`/`SMTP_PORT`/`SMTP_USERNAME`/
+  `SMTP_PASSWORD`/`SMTP_FROM_EMAIL` are deliberately generic (not Gmail-specific in name or
+  code) so that swapping the demo's Google Workspace account for a production client's own
+  mail server is purely a `.env` change — see the user's own framing of this when the
+  feature was requested. `SMTP_HOST`/`SMTP_PORT` default to `smtp.gmail.com`/`587`;
+  the other three have no default and gate `email_enabled()`.
+- **Every "Approve & Send" goes to `config.CHASER_EMAIL_OVERRIDE`, not a real client
+  address — a deliberate, temporary demo safety valve**, not a config the demo roster will
+  outgrow gracefully. The four `CLIENT_CHECKLISTS` entries in `chaser_data.py` have no email
+  field at all (there's no real "John Doe" to accidentally email), so `chaser_panel.py`
+  always sends to this one override address regardless of which client's card the click came
+  from, and says so explicitly in the panel's own caption. Defaults to
+  `ramya.rajaram@mystiqlabs.ai` via `.env`'s `CHASER_EMAIL_OVERRIDE`. Remove this override
+  (and give `CLIENT_CHECKLISTS` entries real addresses) before any real client send.
+- **The per-client `st.expander` is pinned open via session state for the same reason as the
+  Customer Reconciliation cards' JSON toggle** (see that note elsewhere in this file):
+  clicking **Edit** or **Approve & Send** triggers a script rerun, and `st.expander` without
+  a pinned `expanded=` snaps back to collapsed on that rerun — which would hide the very
+  fields/buttons the reviewer just clicked. `chaser_panel.py` tracks this per client as
+  `chaser_expanded_<folder>`, set `True` by `_run_batch` for any client with an outstanding
+  item (so cards needing review auto-open right after a scan) and `False` for a client with
+  nothing outstanding (so a now-resolved client collapses back down on the next scan).
 - **`post_chaser_email` is a deliberately wider Slack privacy boundary than
   `notify_document_outcome`, and the two are documented separately in
   `slack_notifier.py`'s module docstring because of it.** The IDP workflow's Slack message
@@ -595,31 +628,37 @@ python -m py_compile app.py src/*.py src/ui/*.py
 ## Security & execution handling rules
 
 - **Credentials load from environment only.** `src/config.py` reads `ANTHROPIC_API_KEY`,
-  `CLAUDE_MODEL`, `SLACK_BOT_TOKEN`, and `SLACK_CHANNEL` via `python-dotenv` / `os.getenv`.
-  Never add a raw API key/token text input to the UI, never hardcode one, never log one.
+  `CLAUDE_MODEL`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL`, `SMTP_HOST`, `SMTP_PORT`,
+  `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, and `CHASER_EMAIL_OVERRIDE` via
+  `python-dotenv` / `os.getenv`. Never add a raw API key/token/password text input to the
+  UI, never hardcode one, never log one.
 - **`.env` is gitignored.** Only `.env.example` (placeholder values) is committed.
-- **Nothing is persisted, with one deliberate, narrow exception: Slack.** Uploaded documents,
-  rendered images, extracted PII/TINs, and reconciliation results live only in
-  `st.session_state` for the life of the browser session — no disk write, database, or
-  external storage call for any of that. The one outbound call in `src/` is
-  `slack_notifier.notify_document_outcome` (see `src/slack_notifier.py`, wired into
-  `results_panel.py`'s per-document processing loop), and it's scoped tightly on purpose:
-  **only** the document's filename, detected type, and audit status label (Clean Match /
-  Compliance Notice / Variance / Informational / Failed) ever leave the app. It never sends
-  the TIN/SSN/EIN, recipient/employee/partner name, dollar amounts, or any other extracted
-  field — see that module's docstring for the exact boundary. Slack is optional
-  (`slack_notifier.slack_enabled()` is `False`, and nothing is sent, unless both
-  `SLACK_BOT_TOKEN` and `SLACK_CHANNEL` are set) and best-effort: a failed send (bad token,
-  bot not invited to the channel, network error) is caught inside `slack_notifier.py`,
-  surfaced as a `st.warning` summary in `results_panel.py`, and never raises — it can't
-  interrupt extraction or reconciliation for the rest of the batch. If you widen what gets
-  sent, or add another outbound integration, update the sidebar's privacy card wording
-  (`.idp-privacy-card` markup in `src/ui/sidebar.py`, styled in `theme.py`) to match reality —
-  it's a compact custom HTML card, not a native `st.info`, precisely so its size/typography
-  could be tuned independently of every other alert in the app. Keep the wording short (title
-  + one-line italic subtitle + one short sentence) — it was deliberately condensed from a
-  taller `st.info` paragraph, and ballooning it back into a paragraph defeats the point of the
-  redesign.
+- **Nothing is persisted outside `st.session_state`, but there are now three deliberate,
+  narrowly-scoped outbound calls — not one.** Uploaded documents, rendered images, extracted
+  PII/TINs, and reconciliation results still live only in `st.session_state` for the life of
+  the browser session — no disk write or database anywhere. The three outbound calls, each
+  with its own privacy boundary (don't conflate them when changing one):
+  1. `slack_notifier.notify_document_outcome` (IDP workflow, wired into
+     `results_panel.py`'s per-document loop) — **only** filename, detected type, and audit
+     status label. Never a TIN/SSN/EIN, name, or dollar amount.
+  2. `slack_notifier.post_chaser_email` (Document Chaser, wired into `chaser_panel.py`'s
+     `_run_batch`) — a drafted reminder email, which by necessity names the client and their
+     missing/mismatched document types. Still never a TIN/SSN/EIN or dollar amount. See
+     `slack_notifier.py`'s module docstring and the Document Chaser section above.
+  3. `email_sender.send_email` (Document Chaser's "Approve & Send", opt-in per click, not
+     automatic) — sends the same drafted-or-edited subject/body as a real email, to
+     `config.CHASER_EMAIL_OVERRIDE` only (see the Document Chaser section's note on why), via
+     whatever SMTP account `.env` configures.
+  All three are optional and best-effort: a missing config, bad credentials, or network
+  error is caught inside `slack_notifier.py`/`email_sender.py` and surfaced as a UI
+  warning/error, never raised — one failed send can't interrupt anything else. If you widen
+  what any of these three sends, or add a fourth outbound integration, update the sidebar's
+  privacy card wording (`.idp-privacy-card` markup in `src/ui/sidebar.py`, styled in
+  `theme.py`) to match reality — it's a compact custom HTML card, not a native `st.info`,
+  precisely so its size/typography could be tuned independently of every other alert in the
+  app. Keep the wording short (title + one-line italic subtitle + one short sentence) — it
+  was deliberately condensed from a taller `st.info` paragraph, and ballooning it back into a
+  paragraph defeats the point of the redesign.
 - **Upload size is enforced twice:** `.streamlit/config.toml` (`server.maxUploadSize = 10`)
   caps it at the platform level, and `upload_panel.py` re-checks `uploaded_file.size` against
   `config.MAX_UPLOAD_SIZE_BYTES` so the limit holds even if the config file is later changed.
@@ -705,9 +744,16 @@ python -m py_compile app.py src/*.py src/ui/*.py
   — no UI to add/edit a client or their checklist, no persistence of chaser results across a
   session restart (same session-state-only lifetime as the rest of the app). Fine for the
   current demo scope; would need a real client/checklist data store to go further.
-- **Document Chaser drafts and posts to Slack, but doesn't send a real email yet** — the
-  user has explicitly flagged real email sending (via Slack, per their own phrasing) as the
-  next phase once this is confirmed working. Not implemented.
+- **Document Chaser's real email send needs SMTP credentials that aren't filled in by
+  default.** `email_sender.py`/"Approve & Send" are fully built and wired, but
+  `SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_FROM_EMAIL` ship blank in `.env.example` (and the
+  real `.env` until someone fills them in) — until they're set, every "Approve & Send"
+  predictably fails with "Email sending not configured," which is the intended fallback, not
+  a bug. Needs a Google Workspace App Password (demo) or equivalent.
+- **Every Document Chaser send is hardcoded to one override address** (`CHASER_EMAIL_OVERRIDE`)
+  since the demo roster has no real client addresses — see the Document Chaser section's note
+  on this. Giving `CLIENT_CHECKLISTS` entries real addresses and removing the override is a
+  prerequisite for any real client-facing use.
 - **Document Chaser re-extracts every file in every client folder on every click** of "Check
   Documents & Email Clients" — no caching keyed on file content/mtime, so re-running the scan
   re-spends a full Claude vision call per file every time, same per-document ~30s timeout

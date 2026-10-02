@@ -20,6 +20,22 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 
+# Optional: real email sending for Document Chaser's "Approve & Send" (see
+# src/email_sender.py). Generic SMTP, not tied to any one provider — the demo uses Google
+# Workspace (smtp.gmail.com:587 + an App Password), production would point this at the
+# client's own mail server instead. All five must be set or email_sender.email_enabled()
+# returns False and only Slack posting (the existing behavior) happens.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")
+
+# Temporary demo safety valve: every Document Chaser "Approve & Send" goes to this address
+# instead of a real client, since the demo client roster (chaser_data.py) has no real email
+# addresses. Remove/generalize once clients have real addresses to send to.
+CHASER_EMAIL_OVERRIDE = os.getenv("CHASER_EMAIL_OVERRIDE", "ramya.rajaram@mystiqlabs.ai")
+
 MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
